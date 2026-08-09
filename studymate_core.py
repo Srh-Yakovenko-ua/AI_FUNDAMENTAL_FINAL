@@ -212,6 +212,7 @@ STOP_WORDS = {
 }
 MIN_WORD_LENGTH, STEM_LENGTH = 3, 5
 LEXICAL_THRESHOLD = 0.6      # нижче цього збіг вважається слабким
+MIN_QUERY_LENGTH = 4         # коротший запит не несе змісту: «я» не має нічого знаходити
 RRF_K = 60                   # стандартна константа згладжування для RRF
 
 
@@ -530,10 +531,124 @@ def check_applicability(formula: Formula, situation: str) -> ApplicabilityVerdic
                                 tuple(sorted(detected)))
 
 
+from functools import wraps
+
 from langchain_core.tools import tool
 
 
+def requires(**field_prompts):
+    """Декоратор: перевіряє, що названі аргументи не порожні.
+
+    Раніше ці ж три рядки перевірки повторювалися в кожному з чотирьох інструментів.
+    Декоратор прибирає дублювання і, головне, робить вимогу видимою в сигнатурі:
+    видно, який аргумент обовʼязковий і що саме побачить студент, якщо його забути.
+    """
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            bound = dict(zip(func.__code__.co_varnames, args))
+            bound.update(kwargs)
+            for field, prompt in field_prompts.items():
+                value = bound.get(field)
+                if not value or not str(value).strip():
+                    return prompt
+            return func(*args, **kwargs)
+        return wrapper
+    return decorator
+
+
+# --- чисті функції рендерингу --------------------------------------------
+def render_card(formula: Formula, found_by: str = "") -> str:
+    """Картка формули у вигляді тексту. Нічого не шукає й не вирішує."""
+    lines = [
+        f"{formula.name.upper()} ({formula.subject})",
+        "",
+        f"Формула: {formula.expression}",
+        "",
+        "Змінні:",
+    ]
+    lines += [f"  {sym}: {meaning}" for sym, meaning in formula.variables.items()]
+    lines += ["", f"Приклад: {formula.example}"]
+    if formula.note:
+        lines += ["", f"⚠️ Умова застосовності: {formula.note}"]
+    if formula.source:
+        lines += ["", f"Джерело: {formula.source}"]
+    if found_by:
+        lines += ["", f"[знайдено: {found_by}, id={formula.uid}]"]
+    return "\n".join(lines)
+
+
+def render_options(results: Sequence[RetrievalResult]) -> str:
+    """Перелік варіантів для уточнення."""
+    return "\n".join(f"  • {r.formula.name} ({r.formula.subject})" for r in results)
+
+
+def render_verdict(formula: Formula, verdict: ApplicabilityVerdict) -> list:
+    """Рядки вердикту про придатність однієї формули."""
+    return [formula.name, f"  {verdict.verdict_label}. {verdict.reason}"]
+
+
+# --- резолвер: пошук формули разом з рішенням про довіру ------------------
+@dataclass
+class Resolution:
+    """Результат спроби знайти формулу.
+
+    Три взаємовиключні стани, і кожен веде до своєї поведінки продукту:
+    formula   знайдено впевнено, можна працювати;
+    options   знайдено кілька однаково близьких, треба перепитати;
+    message   нічого придатного, треба чесно відмовити.
+    """
+
+    formula: Optional[Formula] = None
+    options: Sequence[RetrievalResult] = ()
+    message: str = ""
+    found_by: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.formula is not None
+
+
+def resolve_formula(query: str, top_k: int = 3) -> Resolution:
+    """Шукає формулу і вирішує, чи можна віддавати її як відповідь.
+
+    Ця логіка потрібна двом інструментам: пошуку і перевірці застосовності.
+    Коли вона була продубльована, гейт впевненості стояв лише в одному з них,
+    і другий на запит «закон збереження імпульсу» впевнено віддавав ЗАКОН ОМА.
+    Спільний резолвер робить таке розходження неможливим.
+    """
+    results = hybrid_search(query, top_k=top_k)
+    if not results:
+        subjects = ", ".join(sorted({f.subject for f in FORMULAS}))
+        return Resolution(message=(
+            f"Формули '{query}' немає в базі StudyMate.\n"
+            f"Доступні предмети: {subjects}.\n"
+            "Я не можу навести формулу, якої немає в базі."
+        ))
+
+    # Порядок перевірок принциповий: спершу впевненість, потім нічия.
+    # Якщо перевіряти навпаки, слабкий збіг із двома однаково поганими кандидатами
+    # виглядає як «є кілька варіантів», хоча насправді немає жодного:
+    # запит «закон збереження імпульсу» так проходив як неоднозначність
+    # замість чесної відмови.
+    if not results[0].confident:
+        return Resolution(message=(
+            f"Точного збігу за запитом '{query}' немає.\n"
+            f"Найближче за змістом:\n{render_options(results)}\n\n"
+            "Якщо потрібної формули тут немає, значить її немає в базі."
+        ), options=results)
+
+    if is_ambiguous(results):
+        close = [r for r in results
+                 if abs(r.lexical_score - results[0].lexical_score) < AMBIGUITY_TOLERANCE]
+        return Resolution(options=close)
+
+    return Resolution(formula=results[0].formula, found_by=results[0].found_by)
+
+
+# --- інструменти ----------------------------------------------------------
 @tool
+@requires(query="Вкажи назву формули або тему, наприклад: 'кінетична енергія'.")
 def formula_lookup(query: str) -> str:
     """Шукає формулу з математики, фізики або хімії у перевіреній базі StudyMate.
 
@@ -548,58 +663,46 @@ def formula_lookup(query: str) -> str:
         Картку формули з умовою застосовності, або перелік варіантів, якщо запит
         неоднозначний, або чесне повідомлення, що формули в базі немає.
     """
-    if not query or not query.strip():
-        return "Вкажи назву формули або тему, наприклад: 'кінетична енергія'."
-    if len(query.strip()) < 4:
+    if len(query.strip()) < MIN_QUERY_LENGTH:
         return f"Запит '{query}' закороткий, назви тему повністю."
 
-    results = hybrid_search(query, top_k=3)
-    if not results:
+    resolution = resolve_formula(query)
+    if resolution.ok:
+        return render_card(resolution.formula, resolution.found_by)
+    if resolution.options and not resolution.message:
         return (
-            f"Формули '{query}' немає в базі StudyMate.\n"
-            f"Доступні предмети: {', '.join(sorted({f.subject for f in FORMULAS}))}.\n"
-            "Я не можу навести формулу, якої немає в базі."
-        )
-
-    # Нічия: кілька формул підходять однаково добре, і різниця між ними принципова.
-    if is_ambiguous(results):
-        options = "\n".join(
-            f"  • {r.formula.name} ({r.formula.subject})" for r in results[:3]
-        )
-        return (
-            f"За запитом '{query}' підходять кілька формул:\n{options}\n\n"
+            f"За запитом '{query}' підходять кілька формул:\n"
+            f"{render_options(resolution.options)}\n\n"
             "Уточни, яка саме потрібна, або опиши умову задачі: "
             "тоді я перевірю, котра з них підходить."
         )
+    return resolution.message
 
-    best = results[0]
-    if not best.confident:
-        options = "\n".join(f"  • {r.formula.name} ({r.formula.subject})" for r in results)
-        return (
-            f"Точного збігу за запитом '{query}' немає.\n"
-            f"Найближче за змістом:\n{options}\n\n"
-            "Якщо потрібної формули тут немає, значить її немає в базі."
-        )
 
-    f = best.formula
-    lines = [
-        f"{f.name.upper()} ({f.subject})",
-        "",
-        f"Формула: {f.expression}",
-        "",
-        "Змінні:",
-    ]
-    lines += [f"  {sym}: {meaning}" for sym, meaning in f.variables.items()]
-    lines += ["", f"Приклад: {f.example}"]
-    if f.note:
-        lines += ["", f"⚠️ Умова застосовності: {f.note}"]
-    if f.source:
-        lines += ["", f"Джерело: {f.source}"]
-    lines += ["", f"[знайдено: {best.found_by}, id={f.uid}]"]
-    return "\n".join(lines)
+def find_alternative(rejected: Sequence[Formula], task: str) -> Optional[Formula]:
+    """Шукає формулу тієї ж теми, придатну для цієї задачі.
+
+    Потрібна саме тоді, коли перевірка дала «не придатна»: сказати студенту,
+    що формула не підходить, і не назвати правильну, означає лишити його
+    рівно там, звідки він прийшов.
+    """
+    rejected_uids = {f.uid for f in rejected}
+    base_stems = stems(rejected[0].name)
+    for other in FORMULAS:
+        if other.uid in rejected_uids or other.subject != rejected[0].subject:
+            continue
+        if not (stems(other.name) & base_stems):
+            continue
+        if check_applicability(other, task).applicable is True:
+            return other
+    return None
 
 
 @tool
+@requires(
+    formula_name="Вкажи назву формули, яку треба перевірити.",
+    task_description="Наведи умову задачі, інакше перевірити застосовність неможливо.",
+)
 def check_formula_for_task(formula_name: str, task_description: str) -> str:
     """Перевіряє, чи можна застосувати формулу до КОНКРЕТНОЇ умови задачі.
 
@@ -616,66 +719,38 @@ def check_formula_for_task(formula_name: str, task_description: str) -> str:
         Вердикт про придатність із поясненням причини і, за потреби, вказівкою
         на правильну альтернативу.
     """
-    if not formula_name or not formula_name.strip():
-        return "Вкажи назву формули, яку треба перевірити."
-    if not task_description or not task_description.strip():
-        return "Наведи умову задачі, інакше перевірити застосовність неможливо."
-
-    results = hybrid_search(formula_name, top_k=3)
-    if not results:
-        return f"Формули '{formula_name}' немає в базі, перевіряти нічого."
-
-    # Той самий гейт впевненості, що й у formula_lookup. Без нього інструмент
-    # перевірки сам ставав джерелом чужої формули: запит «закон збереження імпульсу»
-    # резолвився в закон Ома і отримував вердикт «придатна».
-    if not results[0].confident:
-        options = "\n".join(f"  • {r.formula.name} ({r.formula.subject})" for r in results)
+    resolution = resolve_formula(formula_name)
+    if resolution.message and not resolution.ok:
         return (
             f"Формули '{formula_name}' немає в базі StudyMate, тому перевіряти нічого.\n"
-            f"Найближче за назвою:\n{options}\n\n"
             "Я не перевіряю формул, яких немає в базі."
         )
 
     # Неоднозначність тут не привід обирати за студента: перевіряємо ВСІ близькі
     # варіанти й показуємо, який з них підходить саме до цієї задачі.
-    candidates = [results[0]]
-    if is_ambiguous(results):
-        candidates = [r for r in results if abs(r.lexical_score - results[0].lexical_score)
-                      < AMBIGUITY_TOLERANCE]
+    candidates = ([r.formula for r in resolution.options] if resolution.options
+                  else [resolution.formula])
 
     lines = [f"Умова задачі: {task_description[:130]}", ""]
     if len(candidates) > 1:
-        lines.append(f"За назвою '{formula_name}' у базі є {len(candidates)} формули, "
-                     "перевіряю кожну:")
-        lines.append("")
+        lines += [f"За назвою '{formula_name}' у базі є {len(candidates)} формули, "
+                  "перевіряю кожну:", ""]
 
     suitable = []
-    for candidate in candidates:
-        f = candidate.formula
-        verdict = check_applicability(f, task_description)
-        lines.append(f"{f.name}")
-        lines.append(f"  {verdict.verdict_label}. {verdict.reason}")
+    for formula in candidates:
+        verdict = check_applicability(formula, task_description)
+        lines += render_verdict(formula, verdict) + [""]
         if verdict.applicable is True:
-            suitable.append(f)
-        lines.append("")
+            suitable.append(formula)
 
-    # Якщо жодна з перевірених не підходить, шукаємо альтернативу тієї ж теми.
-    if not suitable:
-        checked = {c.formula.uid for c in candidates}
-        base_stems = stems(candidates[0].formula.name)
-        alternatives = [
-            other for other in FORMULAS
-            if other.uid not in checked
-            and other.subject == candidates[0].formula.subject
-            and check_applicability(other, task_description).applicable is True
-            and stems(other.name) & base_stems
-        ]
-        if alternatives:
-            alt = alternatives[0]
-            lines += [f"Для цієї задачі підходить: {alt.name}", f"  {alt.expression}"]
-    elif len(candidates) > 1:
-        lines.append(f"Бери: {suitable[0].name}")
-        lines.append(f"  {suitable[0].expression}")
+    if suitable:
+        if len(candidates) > 1:
+            lines += [f"Бери: {suitable[0].name}", f"  {suitable[0].expression}"]
+    else:
+        alternative = find_alternative(candidates, task_description)
+        if alternative:
+            lines += [f"Для цієї задачі підходить: {alternative.name}",
+                      f"  {alternative.expression}"]
 
     return "\n".join(lines).rstrip()
 
