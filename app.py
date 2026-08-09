@@ -42,23 +42,31 @@ if not ensure_api_key():
 @st.cache_resource(show_spinner="Готую базу формул і пошук...")
 def load_core():
     """Ядро вантажимо один раз на сесію: ембеддінги бази не варто рахувати щоразу."""
-    import studymate_core as core
+    import studymate
+
     # build() викликається один раз на сесію завдяки cache_resource.
-    # Модуль сам його не викликає, щоб імпорт лишався дешевим і не потребував мережі.
-    core.semantic.build()
-    return core
+    # Пакет сам його не викликає, щоб імпорт лишався дешевим і не потребував мережі.
+    studymate.SEARCH.build()
+    return studymate
+
+
+@st.cache_resource
+def load_agent():
+    from studymate import StudyMateAgent
+    return StudyMateAgent()
 
 
 core = load_core()
+agent = load_agent()
 
 # --- Бічна панель: стан системи ---------------------------------------------
 with st.sidebar:
     st.subheader("Стан системи")
     st.metric("Формул у базі", len(core.FORMULAS))
     st.metric("З умовами застосовності", sum(1 for f in core.FORMULAS if f.predicates))
-    st.write("**Пошук:**", "гібридний (лексика + семантика)" if core.semantic.available
-             else "лексичний (семантика недоступна)")
-    st.write("**Модель:**", core.LLM_MODEL)
+    st.write("**Пошук:**", "гібридний (лексика + семантика)"
+             if core.SEARCH.semantic.available else "лексичний (семантика недоступна)")
+    st.write("**Модель:**", agent.model_name)
 
     st.divider()
     st.subheader("Спробуй запитати")
@@ -100,10 +108,9 @@ if prompt:
 
     with st.chat_message("assistant"):
         with st.spinner("Шукаю в базі..."):
-            answer, history, tools_used = core.ask(
-                prompt, st.session_state.messages, verbose=False
-            )
-        st.session_state.messages = history
+            turn = agent.ask(prompt, st.session_state.messages)
+        st.session_state.messages = turn.history
+        answer, tools_used = turn.answer, turn.tools_used
         st.markdown(answer)
         if tools_used:
             st.caption(f"🔧 Викликано: {', '.join(tools_used)}")
