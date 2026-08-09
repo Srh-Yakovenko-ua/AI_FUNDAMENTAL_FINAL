@@ -1,8 +1,7 @@
 """Ядро StudyMate: дані, гібридний пошук, фільтр застосовності, інструменти, агент.
 
 Зібрано з тих самих джерел, що й ноутбук, тому логіка гарантовано одна.
-Придатний для імпорту в тестах: семантичний шар і агент будуються ліниво,
-тому імпорт не потребує ані ключа, ані мережі.
+Придатний для імпорту в тестах: семантичний шар і агент будуються ліниво.
 """
 
 import os
@@ -216,20 +215,23 @@ MIN_QUERY_LENGTH = 4         # коротший запит не несе змі�
 RRF_K = 60                   # стандартна константа згладжування для RRF
 
 
+# Типові українські закінчення, від найдовших до найкоротших.
+ENDINGS = ("ами", "ями", "ові", "ого", "ому", "ої", "ий", "ій", "ою", "ею",
+           "ем", "ом", "ів", "ах", "ях", "і", "и", "е", "у", "ю", "а", "я", "о")
+
+
 def stem_word(word: str) -> str:
     """Корінь слова, стійкий до українських відмінків.
 
-    Просте обрізання до N символів тут не працює: «площа» і «площі» мають однакову
-    довжину 5, тому обидва лишалися б собою і не збігалися. Тому коротким словам
-    відрізаємо принаймні одну літеру закінчення, а довгі ріжемо до STEM_LENGTH.
-    «маса»/«маси» дають «мас», «площа»/«площі» дають «площ», «енергія»/«енергії»
-    дають «енерг».
+    Обрізання до фіксованої довжини тут не працює. «закон» має 5 літер і різалося
+    до «зако», а «закону» шість і різалося до «закон»: найприродніший запит
+    «формула закону Ома» не знаходив закон Ома. Тому спершу знімаємо закінчення,
+    і лише потім обмежуємо довжину.
     """
-    if len(word) > STEM_LENGTH:
-        return word[:STEM_LENGTH]
-    if len(word) >= 4:
-        return word[:len(word) - 1]
-    return word
+    for ending in ENDINGS:
+        if word.endswith(ending) and len(word) - len(ending) >= 3:
+            return word[:len(word) - len(ending)][:STEM_LENGTH]
+    return word[:STEM_LENGTH]
 
 
 def stems(text: str, drop_stop: bool = False) -> set:
@@ -420,19 +422,31 @@ SITUATION_MARKERS = {
     "h0 > 0": ["з даху", "з балкона", "з балкону", "з вежі", "зі столу", "з обриву",
                "з висоти", "з мосту", "з дерева", "згори", "з вікна", "зі скелі",
                "з драбини", "з поверху", "поверху", "початкова висота", "h0 =", "h₀ ="],
-    "h0 == 0": ["з землі", "з поверхні землі", "на рівній", "з підлоги", "рівна поверхня"],
+    "h0 == 0": ["з землі", "з поверхні", "на рівній", "рівній поверхні", "рівної поверхні",
+                "горизонтальної поверхні", "з підлоги", "рівна поверхня"],
     "triangle_type != 'прямокутний'": ["гострокутн", "тупокутн", "рівносторонн",
                                        "не прямокутн"],
     "resistance_constant == False": ["змінний опір", "нелінійн", "напівпровідник"],
     # Одиниці: картка вимагає СІ, а в задачі дано інше. Раніше ці предикати були
     # в базі, але жодна гілка їх не перевіряла, тобто вони існували лише на папері.
     "v_units != 'м/с'": ["км/год", "км на годину", "кілометрів на годину", "миль/год"],
-    "T_units != 'К'": ["°c", "цельсі", "градусів цельсія", "за цельсієм"],
+    "T_units != 'К'": ["°c", "°с", "цельсі", "градусів цельсія", "за цельсієм"],
+    # Позитивні ознаки: без них ідеально сформульована умова в СІ лишалася
+    # «не перевіреною», бо підтвердити її було нічим.
+    "T_units == 'К'": ["кельвін", " к)", "у кельвінах"],
+    "v_units == 'м/с'": ["м/с", "метрів на секунду"],
+    "V_units == 'м³'": ["м³", "кубічних метр", "кубометр"],
+    "triangle_type == 'прямокутний'": ["прямокутн"],
+    "resistance_constant == True": ["постійний опір", "опір постійн", "сталий опір"],
     "V_units != 'м³'": ["літр", "мілілітр", " мл ", " л "],
 }
 
 # Слова, після яких маркер втрачає силу: «кидаю НЕ з даху, а з землі».
-NEGATIONS = ("не ", "ні ", "нема", "без ")
+# «без» сюди свідомо не входить: у фізичних умовах повно зворотів «без тертя»
+# і «без опору повітря», і вони не заперечують місце кидання.
+NEGATIONS = ("не ", "ні ", "нема")
+# Межі, на яких заперечення закінчується: далі йде вже інша частина речення.
+NEGATION_STOPPERS = ",;.:"
 
 
 @dataclass
@@ -459,6 +473,21 @@ class ApplicabilityVerdict:
             self.applicable, "⚠️ НЕ ПЕРЕВІРЕНО")
 
 
+def is_negated(text: str, position: int) -> bool:
+    """Чи стоїть маркер під запереченням.
+
+    Заперечення діє від слова «не» до найближчого розділового знака, а не на
+    фіксованому вікні символів. У фразі «не з балкона третього поверху, а з землі»
+    заперечення має накривати і «балкон», і «поверх»: вони в одній частині речення.
+    Вікно фіксованої довжини накривало лише перше слово, і система бачила
+    одночасно «кидання з висоти» і «кидання з землі».
+    """
+    prefix = text[:position]
+    last_stopper = max((prefix.rfind(ch) for ch in NEGATION_STOPPERS), default=-1)
+    clause = prefix[last_stopper + 1:]
+    return any(neg in clause for neg in NEGATIONS)
+
+
 def detect_conditions(situation: str) -> set:
     """Витягує умови задачі з тексту за явними маркерами.
 
@@ -469,14 +498,16 @@ def detect_conditions(situation: str) -> set:
     found = set()
     for condition, markers in SITUATION_MARKERS.items():
         for marker in markers:
-            position = text.find(marker)
-            if position == -1:
-                continue
-            prefix = text[max(0, position - 12):position]
-            if any(neg in prefix for neg in NEGATIONS):
-                continue
-            found.add(condition)
-            break
+            # Перебираємо ВСІ входження, а не лише перше: якщо перше стоїть під
+            # запереченням («не з даху, а потім таки з даху»), наступні мають
+            # лишатися видимими.
+            for match in re.finditer(re.escape(marker), text):
+                if is_negated(text, match.start()):
+                    continue
+                found.add(condition)
+                break
+            if condition in found:
+                break
     return found
 
 
@@ -511,7 +542,14 @@ def check_applicability(formula: Formula, situation: str) -> ApplicabilityVerdic
     найчастіше помиляється, підтверджуючи знайому формулу.
     """
     if not formula.predicates:
-        return ApplicabilityVerdict(True, "Формула не має обмежень у базі.")
+        # Свідомо None, а не True. «У базі немає обмежень» не означає «підходить
+        # саме до цієї задачі»: інакше площа кола отримувала зелену галочку
+        # на задачі про кидання з даху.
+        return ApplicabilityVerdict(
+            None,
+            "У картці немає записаних обмежень, тому автоматично перевірити "
+            "застосовність неможливо. Звір умову задачі самостійно.",
+        )
 
     detected = detect_conditions(situation)
     if not detected:
@@ -693,6 +731,9 @@ def find_alternative(rejected: Sequence[Formula], task: str) -> Optional[Formula
             continue
         if not (stems(other.name) & base_stems):
             continue
+        # Формула без предикатів дає вердикт «не перевірено», а не «придатна»,
+        # тому такий кандидат сюди більше не потрапляє: пропонувати як заміну
+        # можна лише те, що перевірку реально пройшло.
         if check_applicability(other, task).applicable is True:
             return other
     return None
@@ -719,6 +760,9 @@ def check_formula_for_task(formula_name: str, task_description: str) -> str:
         Вердикт про придатність із поясненням причини і, за потреби, вказівкою
         на правильну альтернативу.
     """
+    if len(formula_name.strip()) < MIN_QUERY_LENGTH:
+        return f"Назва '{formula_name}' закоротка, напиши формулу повністю."
+
     resolution = resolve_formula(formula_name)
     if resolution.message and not resolution.ok:
         return (
@@ -746,7 +790,10 @@ def check_formula_for_task(formula_name: str, task_description: str) -> str:
     if suitable:
         if len(candidates) > 1:
             lines += [f"Бери: {suitable[0].name}", f"  {suitable[0].expression}"]
-    else:
+    elif any(check_applicability(f, task_description).applicable is False for f in candidates):
+        # Альтернативу шукаємо ЛИШЕ коли формулу справді відхилено. Раніше сюди
+        # потрапляв і вердикт «не перевірено», і система радила потенціальну
+        # енергію там, де задача ідеально лягала на кінетичну.
         alternative = find_alternative(candidates, task_description)
         if alternative:
             lines += [f"Для цієї задачі підходить: {alternative.name}",
@@ -923,10 +970,13 @@ def plan_exam_prep(query: str) -> str:
 
     # «прост» тут навмисно немає: воно ловило вставне слово «просто»
     # і мовчки міняло оцінку навантаження на третину.
-    if "важк" in text or "склад" in text:
-        difficulty, hours_per_topic = "важка", 2.5
-    elif "легк" in text or "нескладн" in text:
+    # Порядок перевірок принциповий: «нескладн» містить «складн», тому спершу
+    # шукаємо заперечну форму. Голого «склад» тут більше немає: воно ловило
+    # звичайне «складати іспит» і мовчки піднімало оцінку навантаження на третину.
+    if "нескладн" in text or "легк" in text or "прост" in text and "просто" not in text:
         difficulty, hours_per_topic = "легка", 1.0
+    elif "важк" in text or "складн" in text:
+        difficulty, hours_per_topic = "важка", 2.5
     else:
         difficulty, hours_per_topic = "середня", 1.5
     needed, available = round(topics * hours_per_topic), round(days * hours)
