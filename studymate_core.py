@@ -1,8 +1,8 @@
 """Ядро StudyMate: дані, гібридний пошук, фільтр застосовності, інструменти, агент.
 
 Зібрано з тих самих джерел, що й ноутбук, тому логіка гарантовано одна.
-Використовується Streamlit-застосунком (app.py) і придатний для імпорту в тестах.
-Ключ має лежати у змінній середовища OPENAI_API_KEY.
+Придатний для імпорту в тестах: семантичний шар і агент будуються ліниво,
+тому імпорт не потребує ані ключа, ані мережі.
 """
 
 import os
@@ -196,8 +196,13 @@ FORMULAS = [
 FORMULAS_BY_UID = {f.uid: f for f in FORMULAS}
 
 SUBJECTS = {}
-for _f in FORMULAS:
-    SUBJECTS.setdefault(_f.subject, []).append(_f)
+for _formula in FORMULAS:
+    SUBJECTS.setdefault(_formula.subject, []).append(_formula)
+
+STATS = {
+    subject: (len(items), sum(1 for f in items if f.predicates))
+    for subject, items in SUBJECTS.items()
+}
 
 
 STOP_WORDS = {
@@ -210,11 +215,27 @@ LEXICAL_THRESHOLD = 0.6      # нижче цього збіг вважаєтьс
 RRF_K = 60                   # стандартна константа згладжування для RRF
 
 
+def stem_word(word: str) -> str:
+    """Корінь слова, стійкий до українських відмінків.
+
+    Просте обрізання до N символів тут не працює: «площа» і «площі» мають однакову
+    довжину 5, тому обидва лишалися б собою і не збігалися. Тому коротким словам
+    відрізаємо принаймні одну літеру закінчення, а довгі ріжемо до STEM_LENGTH.
+    «маса»/«маси» дають «мас», «площа»/«площі» дають «площ», «енергія»/«енергії»
+    дають «енерг».
+    """
+    if len(word) > STEM_LENGTH:
+        return word[:STEM_LENGTH]
+    if len(word) >= 4:
+        return word[:len(word) - 1]
+    return word
+
+
 def stems(text: str, drop_stop: bool = False) -> set:
-    """Множина коренів значущих слів. Грубий стемінг переживає українські відмінки."""
+    """Множина коренів значущих слів."""
     words = [w.strip(".,;:!?()«»\"'") for w in text.lower().split()]
     return {
-        w[:STEM_LENGTH] for w in words
+        stem_word(w) for w in words
         if len(w) >= MIN_WORD_LENGTH and not (drop_stop and w in STOP_WORDS)
     }
 
@@ -283,9 +304,11 @@ class SemanticSearch:
             self.tokens_used += response.usage.total_tokens
             self.vectors = np.array([item.embedding for item in response.data])
             self.available = True
-        except Exception:
-            # Семантичний шар необовʼязковий: без нього система працює на лексичному
-            # пошуку. Деградація має бути явною для викликача, а не тихою.
+            print(f"✅ Семантичний шар побудовано: {self.vectors.shape}, "
+                  f"токенів {response.usage.total_tokens}")
+        except Exception as error:
+            print(f"⚠️  Семантичний шар вимкнено ({type(error).__name__}). "
+                  "Система працює на лексичному пошуку.")
             self.available = False
         return self.available
 
@@ -306,7 +329,8 @@ class SemanticSearch:
 
 
 semantic = SemanticSearch(FORMULAS)
-semantic.build()
+# У ноутбуці будуємо одразу, щоб демо працювало «з коробки».
+# Модуль studymate_core робить це ліниво, з боку застосунку.
 
 def reciprocal_rank_fusion(*rankings: list, k: int = RRF_K) -> list:
     """Зливає кілька ранжувань у одне за формулою RRF: score = Σ 1/(k + rank).
@@ -392,31 +416,90 @@ def is_ambiguous(results: Sequence[RetrievalResult],
 # Маркери ситуацій у тексті задачі. Це навмисно простий і прозорий механізм:
 # його можна прочитати, перевірити й доповнити, не чіпаючи решту системи.
 SITUATION_MARKERS = {
-    "h0 > 0": ["з даху", "з балкона", "з вежі", "зі столу", "з обриву", "з висоти",
-               "з мосту", "з дерева", "згори"],
-    "h0 == 0": ["з землі", "з поверхні", "на рівній", "з підлоги"],
-    "triangle_type != 'прямокутний'": ["гострокутн", "тупокутн", "рівносторонн"],
+    "h0 > 0": ["з даху", "з балкона", "з балкону", "з вежі", "зі столу", "з обриву",
+               "з висоти", "з мосту", "з дерева", "згори", "з вікна", "зі скелі",
+               "з драбини", "з поверху", "поверху", "початкова висота", "h0 =", "h₀ ="],
+    "h0 == 0": ["з землі", "з поверхні землі", "на рівній", "з підлоги", "рівна поверхня"],
+    "triangle_type != 'прямокутний'": ["гострокутн", "тупокутн", "рівносторонн",
+                                       "не прямокутн"],
     "resistance_constant == False": ["змінний опір", "нелінійн", "напівпровідник"],
+    # Одиниці: картка вимагає СІ, а в задачі дано інше. Раніше ці предикати були
+    # в базі, але жодна гілка їх не перевіряла, тобто вони існували лише на папері.
+    "v_units != 'м/с'": ["км/год", "км на годину", "кілометрів на годину", "миль/год"],
+    "T_units != 'К'": ["°c", "цельсі", "градусів цельсія", "за цельсієм"],
+    "V_units != 'м³'": ["літр", "мілілітр", " мл ", " л "],
 }
+
+# Слова, після яких маркер втрачає силу: «кидаю НЕ з даху, а з землі».
+NEGATIONS = ("не ", "ні ", "нема", "без ")
 
 
 @dataclass
 class ApplicabilityVerdict:
-    """Вердикт про придатність формули разом із причиною."""
+    """Вердикт про придатність формули.
 
-    applicable: bool
+    `applicable` має ТРИ стани, і третій тут принциповий:
+    True    придатна, умови перевірені;
+    False   не придатна, знайдено пряме порушення;
+    None    перевірити не вдалося, у тексті немає ознак.
+
+    Раніше третій випадок зливався з першим, і система за замовчуванням казала
+    «придатна». Для продукту, теза якого «відмова безпечніша за впевнену помилку»,
+    умовчання стояло рівно в протилежний бік.
+    """
+
+    applicable: Optional[bool]
     reason: str
     detected: tuple = ()
 
+    @property
+    def verdict_label(self) -> str:
+        return {True: "✅ ПРИДАТНА", False: "❌ НЕ ПРИДАТНА"}.get(
+            self.applicable, "⚠️ НЕ ПЕРЕВІРЕНО")
+
 
 def detect_conditions(situation: str) -> set:
-    """Витягує умови задачі з тексту за явними маркерами."""
-    text = situation.lower()
+    """Витягує умови задачі з тексту за явними маркерами.
+
+    Маркер під запереченням не зараховується: «кидаю не з даху, а з землі»
+    не має давати умову «кидання з висоти».
+    """
+    text = " " + situation.lower() + " "
     found = set()
     for condition, markers in SITUATION_MARKERS.items():
-        if any(marker in text for marker in markers):
+        for marker in markers:
+            position = text.find(marker)
+            if position == -1:
+                continue
+            prefix = text[max(0, position - 12):position]
+            if any(neg in prefix for neg in NEGATIONS):
+                continue
             found.add(condition)
+            break
     return found
+
+
+# Пари «вимога картки → умова задачі, яка її порушує» разом з поясненням.
+CONTRADICTIONS = {
+    ("h0 == 0", "h0 > 0"):
+        "У задачі тіло кидають з висоти (h₀ > 0), а формула виведена для кидання "
+        "з нульової висоти. Потрібен розрахунок через час польоту.",
+    ("h0 > 0", "h0 == 0"):
+        "У задачі кидають з рівної поверхні (h₀ = 0), а ця формула призначена "
+        "для кидання з висоти. Візьми простішу формулу дальності.",
+    ("triangle_type == 'прямокутний'", "triangle_type != 'прямокутний'"):
+        "Трикутник у задачі не прямокутний, теорема Піфагора не застосовується.",
+    ("resistance_constant == True", "resistance_constant == False"):
+        "У задачі опір не постійний, закон Ома в такій формі не працює.",
+    ("v_units == 'м/с'", "v_units != 'м/с'"):
+        "Швидкість у задачі не в м/с. Спершу переведи одиниці, інакше результат "
+        "буде неправильним у 3.6 раза.",
+    ("T_units == 'К'", "T_units != 'К'"):
+        "Температура в задачі не в кельвінах. Переведи її, інакше рівняння дасть "
+        "безглузде число.",
+    ("V_units == 'м³'", "V_units != 'м³'"):
+        "Об'єм у задачі не в м³. Переведи в СІ: 40 л це 0.04 м³, а не 0.4.",
+}
 
 
 def check_applicability(formula: Formula, situation: str) -> ApplicabilityVerdict:
@@ -432,36 +515,19 @@ def check_applicability(formula: Formula, situation: str) -> ApplicabilityVerdic
     detected = detect_conditions(situation)
     if not detected:
         return ApplicabilityVerdict(
-            True,
-            "У задачі не видно ознак, що порушують умови застосовності. "
-            "Перевір умову самостійно.",
+            None,
+            "В умові немає ознак, за якими можна перевірити застосовність. "
+            "Перевір самостійно: чи виконуються обмеження цієї формули.",
         )
 
     for predicate in formula.predicates:
-        # Пряме протиріччя: картка вимагає h0 == 0, а в задачі знайдено h0 > 0.
-        if predicate == "h0 == 0" and "h0 > 0" in detected:
-            return ApplicabilityVerdict(
-                False,
-                "У задачі тіло кидають з висоти (h₀ > 0), а формула виведена "
-                "для кидання з нульової висоти. Потрібен розрахунок через час польоту.",
-                tuple(detected),
-            )
-        if predicate == "triangle_type == 'прямокутний'" and \
-                "triangle_type != 'прямокутний'" in detected:
-            return ApplicabilityVerdict(
-                False,
-                "Трикутник у задачі не прямокутний, теорема Піфагора не застосовується.",
-                tuple(detected),
-            )
-        if predicate == "resistance_constant == True" and \
-                "resistance_constant == False" in detected:
-            return ApplicabilityVerdict(
-                False,
-                "У задачі опір не постійний, закон Ома в такій формі не працює.",
-                tuple(detected),
-            )
+        for condition in detected:
+            reason = CONTRADICTIONS.get((predicate, condition))
+            if reason:
+                return ApplicabilityVerdict(False, reason, tuple(sorted(detected)))
 
-    return ApplicabilityVerdict(True, "Умови застосовності виконані.", tuple(detected))
+    return ApplicabilityVerdict(True, "Умови застосовності виконані.",
+                                tuple(sorted(detected)))
 
 
 from langchain_core.tools import tool
@@ -502,7 +568,8 @@ def formula_lookup(query: str) -> str:
         )
         return (
             f"За запитом '{query}' підходять кілька формул:\n{options}\n\n"
-            "Уточни ситуацію: наприклад, тіло кидають з рівної поверхні чи з висоти?"
+            "Уточни, яка саме потрібна, або опиши умову задачі: "
+            "тоді я перевірю, котра з них підходить."
         )
 
     best = results[0]
@@ -554,32 +621,63 @@ def check_formula_for_task(formula_name: str, task_description: str) -> str:
     if not task_description or not task_description.strip():
         return "Наведи умову задачі, інакше перевірити застосовність неможливо."
 
-    results = hybrid_search(formula_name, top_k=1)
+    results = hybrid_search(formula_name, top_k=3)
     if not results:
         return f"Формули '{formula_name}' немає в базі, перевіряти нічого."
 
-    f = results[0].formula
-    verdict = check_applicability(f, task_description)
+    # Той самий гейт впевненості, що й у formula_lookup. Без нього інструмент
+    # перевірки сам ставав джерелом чужої формули: запит «закон збереження імпульсу»
+    # резолвився в закон Ома і отримував вердикт «придатна».
+    if not results[0].confident:
+        options = "\n".join(f"  • {r.formula.name} ({r.formula.subject})" for r in results)
+        return (
+            f"Формули '{formula_name}' немає в базі StudyMate, тому перевіряти нічого.\n"
+            f"Найближче за назвою:\n{options}\n\n"
+            "Я не перевіряю формул, яких немає в базі."
+        )
 
-    lines = [f"Формула: {f.name}", f"Умова задачі: {task_description[:120]}", ""]
-    if verdict.applicable:
-        lines.append(f"✅ ПРИДАТНА. {verdict.reason}")
-    else:
-        lines.append(f"❌ НЕ ПРИДАТНА. {verdict.reason}")
-        # Шукаємо альтернативу серед формул тієї ж теми з протилежними умовами.
+    # Неоднозначність тут не привід обирати за студента: перевіряємо ВСІ близькі
+    # варіанти й показуємо, який з них підходить саме до цієї задачі.
+    candidates = [results[0]]
+    if is_ambiguous(results):
+        candidates = [r for r in results if abs(r.lexical_score - results[0].lexical_score)
+                      < AMBIGUITY_TOLERANCE]
+
+    lines = [f"Умова задачі: {task_description[:130]}", ""]
+    if len(candidates) > 1:
+        lines.append(f"За назвою '{formula_name}' у базі є {len(candidates)} формули, "
+                     "перевіряю кожну:")
+        lines.append("")
+
+    suitable = []
+    for candidate in candidates:
+        f = candidate.formula
+        verdict = check_applicability(f, task_description)
+        lines.append(f"{f.name}")
+        lines.append(f"  {verdict.verdict_label}. {verdict.reason}")
+        if verdict.applicable is True:
+            suitable.append(f)
+        lines.append("")
+
+    # Якщо жодна з перевірених не підходить, шукаємо альтернативу тієї ж теми.
+    if not suitable:
+        checked = {c.formula.uid for c in candidates}
+        base_stems = stems(candidates[0].formula.name)
         alternatives = [
             other for other in FORMULAS
-            if other.uid != f.uid
-            and other.subject == f.subject
-            and check_applicability(other, task_description).applicable
-            and stems(other.name) & stems(f.name)
+            if other.uid not in checked
+            and other.subject == candidates[0].formula.subject
+            and check_applicability(other, task_description).applicable is True
+            and stems(other.name) & base_stems
         ]
         if alternatives:
             alt = alternatives[0]
-            lines += ["", f"Замість неї підходить: {alt.name}", f"  {alt.expression}"]
-    if verdict.detected:
-        lines += ["", f"[розпізнані умови: {', '.join(verdict.detected)}]"]
-    return "\n".join(lines)
+            lines += [f"Для цієї задачі підходить: {alt.name}", f"  {alt.expression}"]
+    elif len(candidates) > 1:
+        lines.append(f"Бери: {suitable[0].name}")
+        lines.append(f"  {suitable[0].expression}")
+
+    return "\n".join(lines).rstrip()
 
 
 # Таблиця конвертацій: усі перетворення лінійні, тому зберігаємо коефіцієнти
@@ -596,15 +694,23 @@ PHYSICS_CONVERSIONS = {
     ("г", "кг"): (0.001, 0), ("кг", "г"): (1000, 0),
 }
 
+# Аліаси одиниць з відмінковими формами. Без них найчастіший запит демо
+# «скільки кубічних метрів у 40 літрАХ» не розпізнавався взагалі.
 UNIT_ALIASES = {
-    "км/год": ["км/год", "км/г", "kmh"], "м/с": ["м/с", "m/s"],
-    "л": ["літр", "літрів", "літра", "л"], "м³": ["м³", "кубічн", "м3"],
-    "C": ["цельсія", "цельсій", "цельсіях", "°c", "°с"],
-    "F": ["фаренгейт", "фаренгейтів", "фаренгейтах", "°f"],
-    "K": ["кельвін", "кельвінів", "кельвінах", "кельвіни"],
-    "атм": ["атмосфер", "атм"], "Па": ["паскал", "па"], "бар": ["бар"],
-    "Дж": ["джоул", "дж"], "кал": ["калор", "кал"],
-    "г": ["грам", "грамів"], "кг": ["кілограм", "кг"],
+    "км/год": ["км/год", "км/г", "kmh", "кілометрів на годину"],
+    "м/с": ["м/с", "m/s", "метрів на секунду"],
+    "л": ["літрах", "літрів", "літри", "літра", "літр", "л"],
+    "м³": ["кубічних метрів", "кубічний метр", "кубометр", "м³", "кубічн", "м3"],
+    "C": ["цельсія", "цельсій", "цельсіях", "цельсієм", "°c", "°с"],
+    "F": ["фаренгейтах", "фаренгейтів", "фаренгейти", "фаренгейт", "°f"],
+    "K": ["кельвінах", "кельвінів", "кельвіни", "кельвін", "k"],
+    "атм": ["атмосферах", "атмосфер", "атм"],
+    "Па": ["паскалях", "паскалів", "паскаль", "паскал", "па"],
+    "бар": ["барах", "бар"],
+    "Дж": ["джоулях", "джоулів", "джоуль", "джоул", "дж"],
+    "кал": ["калоріях", "калорій", "калорія", "калор", "кал"],
+    "г": ["грамах", "грамів", "грами", "грам", "г"],
+    "кг": ["кілограмах", "кілограмів", "кілограми", "кілограм", "кг"],
 }
 
 _LETTER = "а-яіїєґёa-z"
@@ -717,7 +823,8 @@ def plan_exam_prep(query: str) -> str:
         return "Вкажи кількість тем, днів і годин на день."
 
     text = query.lower()
-    topics = _first_match([rf"{NUM}\s*тем", rf"тем\w*\s*[-:]?\s*{NUM}"], text)
+    # Прикметники між числом і словом: «20 важких тем», «15 складних тем».
+    topics = _first_match([rf"{NUM}\s*(?:\w+\s+){{0,2}}тем", rf"тем\w*\s*[-:]?\s*{NUM}"], text)
     weeks = _first_match([rf"{NUM}\s*тижн"], text)
     days = weeks * 7 if weeks is not None else _first_match(
         [rf"{NUM}\s*(?:дн|день|доб)", rf"дн\w*\s*[-:]?\s*{NUM}"], text)
@@ -739,14 +846,21 @@ def plan_exam_prep(query: str) -> str:
             f"Більше за {MAX_REALISTIC_HOURS} годин планувати немає сенсу."
         )
 
-    hours_per_topic = 2.5 if ("важк" in text or "склад" in text) else (
-        1.0 if ("легк" in text or "прост" in text) else 1.5)
+    # «прост» тут навмисно немає: воно ловило вставне слово «просто»
+    # і мовчки міняло оцінку навантаження на третину.
+    if "важк" in text or "склад" in text:
+        difficulty, hours_per_topic = "важка", 2.5
+    elif "легк" in text or "нескладн" in text:
+        difficulty, hours_per_topic = "легка", 1.0
+    else:
+        difficulty, hours_per_topic = "середня", 1.5
     needed, available = round(topics * hours_per_topic), round(days * hours)
     per_day = math.ceil(topics / days)
 
     lines = [
         "ПЛАН ПІДГОТОВКИ", "",
         f"Тем: {topics}, днів: {days}, годин на день: {hours:g}",
+        f"Складність матеріалу: {difficulty} ({hours_per_topic:g} год на тему)",
         f"Потрібно годин: {needed}, доступно: {available}",
     ]
     lines.append(
@@ -797,8 +911,22 @@ SYSTEM_PROMPT = """Ти StudyMate, освітній асистент для ст
 Стисло: спочатку суть, потім пояснення, за потреби приклад. Не більше кількох абзаців.
 """
 
-model = ChatOpenAI(model=LLM_MODEL, temperature=0.2, max_tokens=900)
-agent = create_agent(model=model, tools=TOOLS, system_prompt=SYSTEM_PROMPT)
+def build_agent():
+    """Створює агента. Виклик відкладено, щоб імпорт модуля не вимагав ключа:
+    інструменти це чисті функції, і їх треба вміти тестувати офлайн."""
+    model = ChatOpenAI(model=LLM_MODEL, temperature=0.2, max_tokens=900)
+    return create_agent(model=model, tools=TOOLS, system_prompt=SYSTEM_PROMPT)
+
+
+_AGENT = None
+
+
+def get_agent():
+    """Ледаче створення агента: імпорт модуля не має вимагати ключа."""
+    global _AGENT
+    if _AGENT is None:
+        _AGENT = build_agent()
+    return _AGENT
 
 
 ERROR_PREFIX = "⚠️ Помилка виклику агента:"
@@ -825,7 +953,7 @@ def ask(user_input: str, history: Optional[list] = None, verbose: bool = True):
     messages = list(history or [])
     messages.append({"role": "user", "content": user_input})
     try:
-        result = agent.invoke({"messages": messages})
+        result = get_agent().invoke({"messages": messages})
     except Exception as error:
         return f"{ERROR_PREFIX} {type(error).__name__}: {error}", messages, []
 

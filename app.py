@@ -43,6 +43,8 @@ if not ensure_api_key():
 def load_core():
     """Ядро вантажимо один раз на сесію: ембеддінги бази не варто рахувати щоразу."""
     import studymate_core as core
+    # build() викликається один раз на сесію завдяки cache_resource.
+    # Модуль сам його не викликає, щоб імпорт лишався дешевим і не потребував мережі.
     core.semantic.build()
     return core
 
