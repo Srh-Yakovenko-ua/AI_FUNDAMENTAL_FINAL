@@ -1,0 +1,32 @@
+# StudyMate, залежності проєкту.
+# Ноутбук виконувався на Python 3.10.12 (Colab).
+#
+# Межі версій виставлені за фактичним використанням API в коді,
+# а не за тим, що випадково стояло в оточенні.
+
+# Агент: studymate/agent.py -> from langchain.agents import create_agent.
+# create_agent з'явився в langchain 1.0, у 0.x його в цьому модулі немає.
+langchain>=1.0
+
+# Інструменти: studymate/tools.py -> from langchain_core.tools import tool
+langchain-core>=1.0
+
+# Модель: studymate/agent.py -> ChatOpenAI(model="gpt-4o-mini").
+# Версію свідомо не фіксую: pip добирає сумісну з langchain вище.
+langchain-openai
+
+# Ембеддінги: studymate/search.py -> from openai import OpenAI,
+# client.embeddings.create(...). Це клієнт openai v1, у 0.x інший інтерфейс.
+openai>=1.0
+
+# Вектори семантичного шару: studymate/search.py
+numpy>=1.24
+
+# Таблиці вартості й ризиків у ноутбуці
+pandas>=2.0
+
+# Веб-інтерфейс: app.py
+streamlit>=1.30
+
+# langgraph окремо не потрібен: у коді він не імпортується, а до системи
+# потрапляє транзитивно, бо на ньому побудований агент langchain 1.0.
