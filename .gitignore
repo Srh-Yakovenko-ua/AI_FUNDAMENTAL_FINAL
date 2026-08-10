@@ -1,6 +1,19 @@
+# Секрети
+.env
+.env.*
+*.key
+*.pem
+openai_key*
+secrets.json
+
+# Python
 __pycache__/
 *.pyc
 .venv/
 .DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+*-checkpoint.ipynb
 Шаблон презентації*.pptx
 *.zip
